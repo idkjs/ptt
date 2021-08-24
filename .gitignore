@@ -13,3 +13,4 @@ zpipe
 c/dpipe
 *.merlin
 *.install
+.vscode/settings.json
