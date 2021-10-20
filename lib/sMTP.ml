@@ -41,11 +41,13 @@ type error =
   [ `Protocol of
     [ `Protocol of Value.error
     | `Tls_alert of Tls.Packet.alert_type
-    | `Tls_failure of Tls.Engine.failure ]
+    | `Tls_failure of Tls.Engine.failure
+    | `Tls_closed ]
   | `Tls of
     [ `Protocol of Value.error
     | `Tls_alert of Tls.Packet.alert_type
-    | `Tls_failure of Tls.Engine.failure ]
+    | `Tls_failure of Tls.Engine.failure
+    | `Tls_closed ]
   | `No_recipients
   | `Invalid_recipients
   | `Too_many_bad_commands
@@ -59,6 +61,8 @@ let pp_error ppf = function
     Fmt.pf ppf "TLS alert: %s" (Tls.Packet.alert_type_to_string alert)
   | `Protocol (`Tls_failure failure) | `Tls (`Tls_failure failure) ->
     Fmt.pf ppf "TLS failure: %s" (Tls.Engine.string_of_failure failure)
+  | `Tls `Tls_closed | `Protocol `Tls_closed ->
+    Fmt.string ppf "TLS connection closed by peer"
   | `No_recipients -> Fmt.string ppf "No recipients"
   | `Invalid_recipients -> Fmt.string ppf "Invalid recipients"
   | `Too_many_bad_commands -> Fmt.string ppf "Too many bad commands"
@@ -89,7 +93,7 @@ let m_relay_init ctx info =
     send ctx Value.PP_250
       [
         politely ~domain:info.Logic.domain ~ipv4:info.Logic.ipv4; "8BITMIME"
-      ; "SMTPUTF8"; "STARTTLS"; Fmt.strf "SIZE %Ld" info.Logic.size
+      ; "SMTPUTF8"; "STARTTLS"; Fmt.str "SIZE %Ld" info.Logic.size
       ] in
   let reset = ref 0 and bad = ref 0 in
   let rec go () =
@@ -128,8 +132,8 @@ let m_submission_init ctx info ms =
       [
         politely ~domain:info.Logic.domain ~ipv4:info.Logic.ipv4; "8BITMIME"
       ; "SMTPUTF8"; "STARTTLS"
-      ; Fmt.strf "AUTH %a" Fmt.(list ~sep:(const string " ") Mechanism.pp) ms
-      ; Fmt.strf "SIZE %Ld" info.Logic.size
+      ; Fmt.str "AUTH %a" Fmt.(list ~sep:(const string " ") Mechanism.pp) ms
+      ; Fmt.str "SIZE %Ld" info.Logic.size
       ] in
   let reset = ref 0 and bad = ref 0 in
   let rec go () =

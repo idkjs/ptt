@@ -24,20 +24,15 @@ module Make (Stack : Mirage_stack.V4V6) = struct
   end
 
   let rdwr : (Flow.t, Lwt_scheduler.t) Colombe.Sigs.rdwr =
-    let rd flow buf off len = Lwt_scheduler.inj (Flow.recv flow buf off len) in
+    let rd flow buf off len =
+      Lwt_scheduler.inj
+      @@ (Flow.recv flow buf off len >>= function
+          | 0 -> Lwt.return `End
+          | len -> Lwt.return (`Len len)) in
     let wr flow buf off len = Lwt_scheduler.inj (Flow.send flow buf off len) in
     {Colombe.Sigs.rd; Colombe.Sigs.wr}
 
-  let null ~host:_ _ = Ok None (* TODO *)
-
-  let sendmail
-      ~info
-      ?(tls = Tls.Config.client ~authenticator:null ())
-      stack
-      mx_ipaddr
-      emitter
-      producer
-      recipients =
+  let sendmail ~info ~tls stack mx_ipaddr emitter producer recipients =
     let tcp = Stack.tcp stack in
     Stack.TCP.create_connection tcp (mx_ipaddr, 25)
     >|= R.reword_error (fun err -> `Flow err)
@@ -60,11 +55,44 @@ module Make (Stack : Mirage_stack.V4V6) = struct
         | exn -> Lwt.return (Error (`Exn exn)))
     >>= function
     | Ok () -> Lwt.return (Ok ())
+    | Error (`Sendmail `STARTTLS_unavailable) ->
+      Lwt.return_error `STARTTLS_unavailable
     | Error (`Sendmail err) ->
       Lwt.return (R.error_msgf "%a" Sendmail_with_starttls.pp_error err)
     | Error (`Msg _) as err -> Lwt.return err
     | Error (`Exn exn) ->
       Lwt.return (R.error_msgf "Unknown error: %s" (Printexc.to_string exn))
+
+  let sendmail_without_tls ~info stack mx_ipaddr emitter producer recipients =
+    let tcp = Stack.tcp stack in
+    Stack.TCP.create_connection tcp (mx_ipaddr, 25)
+    >|= R.reword_error (fun err -> `Flow err)
+    >>? fun flow ->
+    let flow = Flow.make flow in
+    let ctx = Colombe.State.Context.make () in
+    let domain =
+      let vs = Domain_name.to_strings info.Ptt.Logic.domain in
+      Colombe.Domain.Domain vs in
+    Lwt.catch
+      (fun () ->
+        Sendmail.sendmail lwt rdwr flow ctx ~domain emitter recipients producer
+        |> Lwt_scheduler.prj
+        >|= R.reword_error (fun err -> `Sendmail err))
+      (function
+        | Failure err -> Lwt.return (R.error_msg err)
+        | exn -> Lwt.return (Error (`Exn exn)))
+    >>= function
+    | Ok () -> Lwt.return (Ok ())
+    | Error (`Sendmail err) ->
+      Lwt.return (R.error_msgf "%a" Sendmail.pp_error err)
+    | Error (`Msg _) as err -> Lwt.return err
+    | Error (`Exn exn) ->
+      Lwt.return (R.error_msgf "Unknown error: %s" (Printexc.to_string exn))
+
+  let pp_error ppf = function
+    | `Msg err -> Fmt.string ppf err
+    | `Flow err -> Stack.TCP.pp_error ppf err
+    | `STARTTLS_unavailable -> Fmt.string ppf "STARTTLS unavailable"
 end
 
 module Server (Time : Mirage_time.S) (Stack : Mirage_stack.V4V6) = struct

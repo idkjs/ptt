@@ -55,6 +55,10 @@ let private_key =
 
 let private_key = Rresult.R.get_ok private_key
 
+let tls =
+  let authenticator = R.failwith_error_msg (Ca_certs.authenticator ()) in
+  Tls.Config.client ~authenticator ()
+
 let fiber ~domain map =
   let open Lwt.Infix in
   let open Tcpip_stack_socket.V4V6 in
@@ -71,13 +75,13 @@ let fiber ~domain map =
     ; Ptt.SMTP.tls=
         Tls.Config.server
           ~certificates:(`Single ([cert], private_key))
-          ~authenticator:(fun ~host:_ _ -> Ok None)
+          ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
           ()
     ; Ptt.SMTP.zone= Mrmime.Date.Zone.GMT
     ; Ptt.SMTP.size= 0x1000000L
     } in
   let resolver = Dns_client_lwt.create () in
-  Server.fiber ~port:4242 stackv4 resolver map info
+  Server.fiber ~port:4242 ~tls stackv4 resolver map info
 
 let romain_calascibetta =
   let open Mrmime.Mailbox in

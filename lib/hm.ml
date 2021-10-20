@@ -12,9 +12,22 @@ module Make
 struct
   include Ptt_tuyau.Make (Stack)
 
-  let src = Logs.Src.create "mti-gf"
+  let src = Logs.Src.create "nec"
 
   module Log : Logs.LOG = (val Logs.src_log src)
+
+  module Dns = struct
+    include Dns_client_mirage.Make (Random) (Time) (Mclock) (Stack)
+
+    type +'a io = 'a Lwt.t
+
+    type error =
+      [ `Msg of string
+      | `No_data of [ `raw ] Domain_name.t * Dns.Soa.t
+      | `No_domain of [ `raw ] Domain_name.t * Dns.Soa.t ]
+
+    let getrrecord dns key domain_name = get_resource_record dns key domain_name
+  end
 
   module Random = struct
     type g = Random.g
@@ -30,10 +43,11 @@ struct
   module Relay =
     Ptt.Relay.Make (Lwt_scheduler) (Lwt_io) (Flow) (Resolver) (Random)
 
+  module DMARC = Dmarc_lwt.Make (Dns)
   module Server = Ptt_tuyau.Server (Time) (Stack)
   include Ptt_transmit.Make (Pclock) (Stack) (Relay.Md)
 
-  let smtp_relay_service ?stop ~port stack resolver conf_server =
+  let smtp_verifier_service ?stop ~port stack resolver conf_server =
     Server.init ~port stack >>= fun service ->
     let handler flow =
       let ip, port = Stack.TCP.dst flow in
@@ -62,18 +76,30 @@ struct
     let (`Initialized fiber) = Server.serve_when_ready ?stop ~handler service in
     fiber
 
-  let smtp_logic ~info ~tls stack resolver messaged map =
+  let epoch () =
+    Int64.of_float (Ptime.to_float_s (Ptime.v (Pclock.now_d_ps ())))
+
+  let smtp_logic ~info:_ ~tls:_ stack _resolver messaged _map =
+    let dns = Dns.create stack in
     let rec go () =
       Relay.Md.await messaged >>= fun () ->
       Relay.Md.pop messaged >>= function
       | None -> Lwt.pause () >>= go
-      | Some ((key, _, _) as v) ->
-        let transmit () =
-          Relay.resolve_recipients ~domain:info.Ptt.SSMTP.domain resolver map
-            (List.map fst (Ptt.Messaged.recipients key))
-          >>= fun recipients -> transmit ~info ~tls stack v recipients in
-        Lwt.async transmit
-        ; Lwt.pause () >>= go in
+      | Some (key, _queue, consumer) ->
+        Log.debug (fun m -> m "Got an email.")
+        ; let verify_and_transmit () =
+            let sender, _ = Ptt.Messaged.from key in
+            let ctx =
+              Spf.empty |> Spf.with_ip (Ptt.Messaged.ipaddr key) |> fun ctx ->
+              Option.fold ~none:ctx
+                ~some:(fun sender -> Spf.with_sender (`MAILFROM sender) ctx)
+                sender in
+            DMARC.verify ~newline:Dmarc.CRLF ~ctx ~epoch dns consumer
+            >>= function
+            | Ok _ -> assert false
+            | Error _ -> assert false in
+          Lwt.async verify_and_transmit
+          ; Lwt.pause () >>= go in
     go ()
 
   let fiber ?stop ~port ~tls stack resolver map info =
@@ -81,7 +107,7 @@ struct
     let messaged = Relay.messaged conf_server in
     Lwt.join
       [
-        smtp_relay_service ?stop ~port stack resolver conf_server
+        smtp_verifier_service ?stop ~port stack resolver conf_server
       ; smtp_logic ~info ~tls stack resolver messaged map
       ]
 end

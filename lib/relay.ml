@@ -34,11 +34,10 @@ struct
     server.count <- Int64.succ server.count
     ; v
 
-  type error = [ `Error of SMTP.error | `Connection_close | `Too_big_data ]
+  type error = [ `Error of SMTP.error | `Too_big_data ]
 
   let pp_error ppf = function
     | `Error err -> SMTP.pp_error ppf err
-    | `Connection_close -> Fmt.pf ppf "Connection close"
     | `Too_big_data -> Fmt.pf ppf "Too big data"
 
   let properly_close_tls flow ctx =
@@ -49,8 +48,13 @@ struct
     in
     run flow m
 
-  let accept : Flow.t -> Resolver.t -> server -> (unit, error) result IO.t =
-   fun flow resolver server ->
+  let accept :
+         ipaddr:Ipaddr.t
+      -> Flow.t
+      -> Resolver.t
+      -> server
+      -> (unit, error) result IO.t =
+   fun ~ipaddr flow resolver server ->
     let ctx = Sendmail_with_starttls.Context_with_tls.make () in
     let m = SMTP.m_relay_init ctx server.info in
     run flow m >>? function
@@ -61,7 +65,7 @@ struct
       >>= function
       | true ->
         let id = succ server in
-        let key = Messaged.v ~domain_from ~from ~recipients id in
+        let key = Messaged.v ~domain_from ~from ~recipients ~ipaddr id in
         Md.push server.messaged key >>= fun producer ->
         let m = SMTP.m_mail ctx in
         run flow m >>? fun () ->

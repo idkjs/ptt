@@ -11,7 +11,7 @@ let () = Sys.set_signal Sys.sigpipe Sys.Signal_ignore
 
 module Scheduler = Colombe.Sigs.Make (struct type +'a t = 'a Lwt.t end)
 
-let unix =
+let lwt =
   let open Lwt.Infix in
   let open Scheduler in
   {
@@ -69,9 +69,9 @@ let auth0 =
 let authentication_test_0 =
   Alcotest_lwt.test_case "authentication 0" `Quick @@ fun _sw () ->
   let auth hash mechanism authenticator fmt =
-    Fmt.kstrf
+    Fmt.kstr
       (fun payload ->
-        Ptt.Authentication.decode_authentication unix hash mechanism
+        Ptt.Authentication.decode_authentication lwt hash mechanism
           authenticator
           (Base64.encode_exn payload)
         |> Scheduler.prj)
@@ -255,14 +255,12 @@ let messaged_test_0 =
         ~domain_from:
           ((Rresult.R.get_ok <.> Colombe_emile.to_domain) domain_from)
         ~from:((Rresult.R.get_ok <.> Colombe_emile.to_reverse_path) from, [])
-        ~recipients:[] 0L in
+        ~recipients:[] ~ipaddr:(Ipaddr.V4 Ipaddr.V4.localhost) 0L in
     Md.push md key >>= fun producer ->
     let v = v () (* XXX(dinosaure): really create the stream. *) in
     let rec consume () =
       v () >>= function
-      | Some ((str, off, len) as chunk) ->
-        Fmt.epr "[-] %S.\n%!" (String.sub str off len)
-        ; producer (Some chunk) >>= consume
+      | Some chunk -> producer (Some chunk) >>= consume
       | None -> producer None in
     consume () in
   let contents = ref "" in
@@ -275,8 +273,7 @@ let messaged_test_0 =
       let rec consume () =
         v () >>= function
         | Some (str, off, len) ->
-          Fmt.epr "[+] %S.\n%!" (String.sub str off len)
-          ; Buffer.add_substring buf str off len
+          Buffer.add_substring buf str off len
           ; consume ()
         | None ->
           contents := Buffer.contents buf
@@ -312,7 +309,7 @@ let messaged_test_1 =
           ~domain_from:
             ((Rresult.R.get_ok <.> Colombe_emile.to_domain) domain_from)
           ~from:((Rresult.R.get_ok <.> Colombe_emile.to_reverse_path) from, [])
-          ~recipients:[] 0L in
+          ~recipients:[] ~ipaddr:(Ipaddr.V4 Ipaddr.V4.localhost) 0L in
       Md.push md key >>= fun producer ->
       let rec consume () =
         v () >>= function
@@ -361,13 +358,13 @@ let rdwr_from_flows inputs outputs =
   let open Scheduler in
   let rd () bytes off len =
     match !inputs with
-    | [] -> inj (Lwt.return 0)
+    | [] -> inj (Lwt.return `End)
     | x :: r ->
       let len = min (String.length x) len in
       Bytes.blit_string x 0 bytes off len
       ; if len = String.length x then inputs := r
         else inputs := String.sub x len (String.length x - len) :: r
-      ; inj (Lwt.return len) in
+      ; inj (Lwt.return (`Len len)) in
   let rec wr () bytes off len =
     match !outputs with
     | [] -> Fmt.failwith "Unexpected output: %S" (String.sub bytes off len)
@@ -401,10 +398,9 @@ let run_state m rdwr =
       rdwr.Colombe.Sigs.wr () buffer off len |> prj >>= fun () -> go (k len)
     | Colombe.State.Return v -> Lwt.return (Ok v)
     | Colombe.State.Error err -> Lwt.return (Error (`Error err))
-    | Colombe.State.Read {buffer; off; len; k} -> (
-      rdwr.Colombe.Sigs.rd () buffer off len |> prj >>= function
-      | 0 -> Lwt.return (Rresult.R.error `Connection_close)
-      | n -> go (k n)) in
+    | Colombe.State.Read {buffer; off; len; k} ->
+      rdwr.Colombe.Sigs.rd () buffer off len |> prj >>= fun res -> go (k res)
+  in
   go m
 
 let load_file filename =
@@ -429,7 +425,7 @@ let private_key = Rresult.R.get_ok private_key
 let fake_tls_config =
   Tls.Config.server
     ~certificates:(`Single ([cert], private_key))
-    ~authenticator:(fun ~host:_ _ -> Ok None)
+    ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
     ()
 
 let smtp_test_0 =
@@ -447,11 +443,12 @@ let smtp_test_0 =
   let open Lwt.Infix in
   run_state (Ptt.SSMTP.m_relay_init ctx info) rdwr >>= function
   | Ok _ -> Alcotest.fail "Unexpected good result"
-  | Error (`Error _) -> Alcotest.fail "Unexpected protocol error"
-  | Error `Connection_close ->
+  | Error (`Error (`Protocol `End_of_input)) ->
     Alcotest.(check unit) "empty stream" (check ()) ()
     ; Alcotest.(check pass) "connection close" () ()
     ; Lwt.return_unit
+  | Error (`Error err) ->
+    Alcotest.failf "Unexpected protocol error: %a" Ptt.SSMTP.pp_error err
 
 let smtp_test_1 =
   Alcotest_lwt.test_case "SMTP (relay) 1" `Quick @@ fun _sw () ->
@@ -669,7 +666,8 @@ let smtp_test_6 =
     Alcotest.(check unit) "empty stream" (check ()) ()
     ; Alcotest.(check pass) "quit" () ()
     ; Lwt.return_unit
-  | Ok (`Authentication _) -> Alcotest.failf "Unexpected authentication"
+  | Ok (`Authentication _ | `Authentication_with_payload _) ->
+    Alcotest.failf "Unexpected authentication"
   | Ok (`Submission _) -> Alcotest.failf "Unexpected submission"
   | Error (`Error err) ->
     Alcotest.failf "Unexpected protocol error: %a" Ptt.SSMTP.pp_error err
@@ -696,7 +694,7 @@ let smtp_test_7 =
   let open Lwt.Infix in
   run_state (Ptt.SSMTP.m_submission_init ctx info [Ptt.Mechanism.PLAIN]) rdwr
   >>= function
-  | Ok (`Authentication (v, m)) ->
+  | Ok (`Authentication (v, m) | `Authentication_with_payload (v, m, _)) ->
     let gmail =
       let open Mrmime.Mailbox in
       Domain.(v domain [a "gmail"; a "com"]) in
@@ -805,7 +803,9 @@ let serve_when_ready ?stop ~handler socket =
        ; t in
      let rec loop () =
        Lwt_unix.accept socket >>= fun (flow, _) ->
-       Lwt.async (fun () -> handler flow)
+       let[@warning "-8"] (Unix.ADDR_INET (inet_addr, _)) =
+         Lwt_unix.getpeername flow in
+       Lwt.async (fun () -> handler (Ipaddr_unix.of_inet_addr inet_addr) flow)
        ; Lwt.pause () >>= loop in
      let stop =
        Lwt.pick [switched_off; loop ()] >>= fun `Stopped ->
@@ -827,9 +827,9 @@ let make_submission_smtp_server ?stop ~port info =
     Lwt_unix.bind socket sockaddr >|= fun () ->
     Lwt_unix.listen socket 40
 
-    ; let handler flow =
+    ; let handler ipaddr flow =
         let open Lwt.Infix in
-        SMTP.accept flow () conf_server >>= fun res ->
+        SMTP.accept ~ipaddr flow () conf_server >>= fun res ->
         Lwt_unix.close flow >>= fun () ->
         match res with Ok _ -> Lwt.return () | Error _err -> Lwt.return () in
       serve_when_ready ?stop ~handler socket in
@@ -862,13 +862,17 @@ let sendmail ipv4 port ~domain sender recipients contents =
     | None -> Lwt.return None in
   let stream = Scheduler.inj <.> stream in
   let tls_config =
-    Tls.Config.client ~authenticator:(fun ~host:_ _ -> Ok None) () in
+    Tls.Config.client ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None) () in
   let ctx = Sendmail_with_starttls.Context_with_tls.make () in
   let rdwr =
     {
       Colombe.Sigs.rd=
         (fun fd buf off len ->
-          let fiber = Lwt_unix.read fd buf off len in
+          let fiber =
+            Lwt.Infix.(
+              Lwt_unix.read fd buf off len >>= function
+              | 0 -> Lwt.return `End
+              | len -> Lwt.return (`Len len)) in
           Scheduler.inj fiber)
     ; Colombe.Sigs.wr=
         (fun fd buf off len ->
@@ -884,7 +888,7 @@ let sendmail ipv4 port ~domain sender recipients contents =
     (Unix.ADDR_INET (Ipaddr_unix.to_inet_addr (Ipaddr.V4 ipv4), port))
   >>= fun () ->
   let res =
-    Sendmail_with_starttls.sendmail unix rdwr socket ctx tls_config ~domain
+    Sendmail_with_starttls.sendmail lwt rdwr socket ctx tls_config ~domain
       sender recipients stream in
   let open Lwt.Infix in
   Scheduler.prj res >>= function
@@ -934,7 +938,8 @@ let full_test_0 =
     "inbox" contents
     [
       Ptt.Messaged.v ~domain_from:recoil ~from:(anil, [])
-        ~recipients:[romain_calascibetta, []] 0L
+        ~recipients:[romain_calascibetta, []]
+        ~ipaddr:(Ipaddr.V4 Ipaddr.V4.localhost) 0L
     ]
   ; Lwt.return_unit
 
@@ -992,9 +997,11 @@ let full_test_1 =
     "inbox" contents
     [
       Ptt.Messaged.v ~domain_from:gazagnaire ~from:(thomas, [])
-        ~recipients:[romain_calascibetta, []] 1L
+        ~recipients:[romain_calascibetta, []]
+        ~ipaddr:(Ipaddr.V4 Ipaddr.V4.localhost) 1L
     ; Ptt.Messaged.v ~domain_from:recoil ~from:(anil, [])
-        ~recipients:[romain_calascibetta, []] 0L
+        ~recipients:[romain_calascibetta, []]
+        ~ipaddr:(Ipaddr.V4 Ipaddr.V4.localhost) 0L
     ]
   ; Lwt.return_unit
 
